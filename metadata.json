@@ -1,0 +1,6 @@
+{
+  "name": "LunaCycle",
+  "description": "Menstruation period tracker, fertility forecaster, hormonal insights, and offline-first PWA synced with Google Sheets Apps Script.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
