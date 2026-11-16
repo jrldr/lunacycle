@@ -1,20 +1,39 @@
 import React, { useMemo, useState } from 'react';
-import { Activity, BarChart3, Thermometer } from 'lucide-react';
+import {
+  Activity,
+  BarChart3,
+  BookOpen,
+  HeartPulse,
+  RefreshCw,
+  Sparkles,
+  Thermometer,
+} from 'lucide-react';
 import {
   CycleForecast,
   CyclePhase,
   CycleRecord,
   DailyLog,
   HormonePoint,
+  UserProfile,
 } from '../types/cycle';
 import {
+  calculateAge,
+  calculateBMI,
   diffDaysISO,
   formatShortDate,
   generateHormoneCurve,
   normalizeCycles,
 } from '../utils/cycleCalculator';
+import {
+  AIHealthSummary,
+  HORMONE_DEFINITIONS,
+  buildLocalHealthSummary,
+  getCycleStageGuides,
+  getDaySpecificExpectations,
+} from '../utils/hormoneGuide';
 
 interface InsightsViewProps {
+  profile: UserProfile;
   cycles: CycleRecord[];
   logs: Record<string, DailyLog>;
   forecast: CycleForecast;
@@ -43,6 +62,7 @@ function buildSmoothPath(points: Array<{ x: number; y: number }>): string {
 }
 
 export const InsightsView: React.FC<InsightsViewProps> = ({
+  profile,
   cycles,
   logs,
   forecast,
@@ -68,65 +88,173 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
     fsh: false,
   });
 
+  // AI Health Summary state (pre-seeded cleanly with local deterministic summary, upgradeable with Gemini)
+  const localBaselineSummary = useMemo(
+    () => buildLocalHealthSummary(profile, cycles, logs, forecast),
+    [profile, cycles, logs, forecast]
+  );
+  const [aiSummary, setAiSummary] = useState<AIHealthSummary | null>(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
+
   const activePoint: HormonePoint =
     hormonePoints.find((p) => p.day === inspectedDay) || hormonePoints[0];
+
+  const dayExpectations = useMemo(
+    () =>
+      getDaySpecificExpectations(
+        activePoint.day,
+        forecast.averageCycleLength,
+        forecast.averagePeriodLength
+      ),
+    [activePoint.day, forecast.averageCycleLength, forecast.averagePeriodLength]
+  );
+
+  const stageGuides = useMemo(
+    () =>
+      getCycleStageGuides(
+        forecast.averageCycleLength,
+        forecast.averagePeriodLength
+      ),
+    [forecast.averageCycleLength, forecast.averagePeriodLength]
+  );
 
   const normalizedCycles = useMemo(() => normalizeCycles(cycles), [cycles]);
 
   // Compute symptom frequency and phase correlation from user logs
-  const { symptomCounts, phaseSymptomMap, totalLoggedDays, bbtPoints } = useMemo(() => {
-    const counts: Record<string, number> = {};
-    const phaseMap: Record<CyclePhase, Record<string, number>> = {
-      Menstrual: {},
-      Follicular: {},
-      Fertile: {},
-      Luteal: {},
-    };
-    const bbtList: Array<{ date: string; temp: number }> = [];
+  const { symptomCounts, moodCounts, phaseSymptomMap, totalLoggedDays, bbtPoints } =
+    useMemo(() => {
+      const counts: Record<string, number> = {};
+      const mCounts: Record<string, number> = {};
+      const phaseMap: Record<CyclePhase, Record<string, number>> = {
+        Menstrual: {},
+        Follicular: {},
+        Fertile: {},
+        Luteal: {},
+      };
+      const bbtList: Array<{ date: string; temp: number }> = [];
 
-    const sortedLogDates = Object.keys(logs).sort();
-    sortedLogDates.forEach((date) => {
-      const log = logs[date];
-      if (!log) return;
+      const sortedLogDates = Object.keys(logs).sort();
+      sortedLogDates.forEach((date) => {
+        const log = logs[date];
+        if (!log) return;
 
-      if (typeof log.bbtCelsius === 'number') {
-        bbtList.push({ date, temp: log.bbtCelsius });
-      }
-
-      // Determine cycle phase for that historical log date
-      let phase: CyclePhase = 'Follicular';
-      const matchingCycle = [...normalizedCycles]
-        .reverse()
-        .find((c) => c.startDate <= date);
-
-      if (matchingCycle) {
-        const cDay = diffDaysISO(matchingCycle.startDate, date) + 1;
-        const cLen = matchingCycle.cycleLength || forecast.averageCycleLength;
-        const ovDay = Math.max(matchingCycle.periodLength + 2, cLen - 14);
-        if (cDay >= 1 && cDay <= matchingCycle.periodLength) {
-          phase = 'Menstrual';
-        } else if (cDay >= ovDay - 5 && cDay <= ovDay + 1) {
-          phase = 'Fertile';
-        } else if (cDay > ovDay + 1) {
-          phase = 'Luteal';
+        if (typeof log.bbtCelsius === 'number') {
+          bbtList.push({ date, temp: log.bbtCelsius });
         }
+        if (log.mood) {
+          mCounts[log.mood] = (mCounts[log.mood] || 0) + 1;
+        }
+
+        let phase: CyclePhase = 'Follicular';
+        const matchingCycle = [...normalizedCycles]
+          .reverse()
+          .find((c) => c.startDate <= date);
+
+        if (matchingCycle) {
+          const cDay = diffDaysISO(matchingCycle.startDate, date) + 1;
+          const cLen = matchingCycle.cycleLength || forecast.averageCycleLength;
+          const ovDay = Math.max(matchingCycle.periodLength + 2, cLen - 14);
+          if (cDay >= 1 && cDay <= matchingCycle.periodLength) {
+            phase = 'Menstrual';
+          } else if (cDay >= ovDay - 5 && cDay <= ovDay + 1) {
+            phase = 'Fertile';
+          } else if (cDay > ovDay + 1) {
+            phase = 'Luteal';
+          }
+        }
+
+        log.symptoms.forEach((sym) => {
+          counts[sym] = (counts[sym] || 0) + 1;
+          phaseMap[phase][sym] = (phaseMap[phase][sym] || 0) + 1;
+        });
+      });
+
+      const ranked = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+
+      return {
+        symptomCounts: ranked,
+        moodCounts: mCounts,
+        phaseSymptomMap: phaseMap,
+        totalLoggedDays: sortedLogDates.length,
+        bbtPoints: bbtList.slice(-14),
+      };
+    }, [logs, normalizedCycles, forecast.averageCycleLength]);
+
+  const handleGenerateAISummary = async () => {
+    if (!navigator.onLine) {
+      setAiError('You are offline. Showing local pattern summary instead.');
+      setAiSummary(localBaselineSummary);
+      return;
+    }
+
+    setAiLoading(true);
+    setAiError(null);
+    try {
+      const age = calculateAge(profile.birthday);
+      const bmi = calculateBMI(profile.weightKg, profile.heightCm);
+
+      const response = await fetch('/api/health-summary', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          profileSummary: {
+            age,
+            bmi: bmi?.value ?? null,
+            baselineCycleLength: profile.baselineCycleLength,
+            baselinePeriodLength: profile.baselinePeriodLength,
+          },
+          forecastSummary: {
+            averageCycleLength: forecast.averageCycleLength,
+            averagePeriodLength: forecast.averagePeriodLength,
+            completedCyclesCount: forecast.completedCyclesCount,
+            cycleRegularityLabel: forecast.cycleRegularityLabel,
+            cycleVariationDays: forecast.cycleVariationDays,
+            currentPhase: forecast.currentPhase,
+            currentCycleDay: forecast.currentCycleDay,
+            nextPeriodStart: forecast.nextPeriodStart,
+            fertileWindowStart: forecast.fertileWindowStart,
+            fertileWindowEnd: forecast.fertileWindowEnd,
+          },
+          recentCycles: normalizedCycles.slice(-6).map((c) => ({
+            startDate: c.startDate,
+            periodLength: c.periodLength,
+            cycleLength: c.cycleLength,
+          })),
+          topSymptoms: symptomCounts.slice(0, 6),
+          moodCounts,
+          bbtSummary: bbtPoints,
+        }),
+      });
+
+      const contentType = response.headers.get('content-type') || '';
+      if (!response.ok || !contentType.includes('application/json')) {
+        // Static host fallback (e.g. GitHub Pages) or server error
+        let errText = 'AI service unavailable on this static host; showing local cycle summary.';
+        if (contentType.includes('application/json')) {
+          const errBody = await response.json();
+          if (errBody?.error) errText = errBody.error;
+        }
+        setAiError(errText);
+        setAiSummary(localBaselineSummary);
+        return;
       }
 
-      log.symptoms.forEach((sym) => {
-        counts[sym] = (counts[sym] || 0) + 1;
-        phaseMap[phase][sym] = (phaseMap[phase][sym] || 0) + 1;
+      const data = await response.json();
+      setAiSummary({
+        ...data,
+        source: 'gemini',
+        generatedAt: new Date().toISOString(),
       });
-    });
+    } catch {
+      setAiError('Could not reach AI summary endpoint; showing local pattern summary.');
+      setAiSummary(localBaselineSummary);
+    } finally {
+      setAiLoading(false);
+    }
+  };
 
-    const ranked = Object.entries(counts).sort((a, b) => b[1] - a[1]);
-
-    return {
-      symptomCounts: ranked,
-      phaseSymptomMap: phaseMap,
-      totalLoggedDays: sortedLogDates.length,
-      bbtPoints: bbtList.slice(-14),
-    };
-  }, [logs, normalizedCycles, forecast.averageCycleLength]);
+  const displayedSummary = aiSummary || localBaselineSummary;
 
   // SVG dimensions for Hormonal Trends chart
   const chartW = 720;
@@ -155,7 +283,6 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
     hormonePoints.map((p) => ({ x: toX(p.day), y: toY(p.fsh) }))
   );
 
-  // Phase band coordinates
   const fertileDays = hormonePoints.filter((p) => p.phase === 'Fertile');
   const fertileXStart =
     fertileDays.length > 0 ? toX(fertileDays[0].day) : padL;
@@ -173,11 +300,104 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
           Hormonal Trends &amp; Health Patterns
         </h1>
         <p className="mt-1 text-xs text-stone-500 dark:text-zinc-400">
-          Estimated endocrine curves calibrated to your {forecast.averageCycleLength}-day cycle average, paired with historical symptom patterns.
+          Estimated endocrine curves calibrated to your {forecast.averageCycleLength}-day cycle average, hormone guide, daily expectations, and AI cycle health summary.
         </p>
       </div>
 
-      {/* 1. Hormonal Trends Chart */}
+      {/* 0. AI Menstrual Health Summary */}
+      <section className="rounded-2xl border border-stone-200 bg-white p-5 sm:p-6 dark:border-zinc-800 dark:bg-[#17151C]">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+          <div className="flex items-start gap-3">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-rose-50 text-[#BE3455] dark:bg-rose-950/50 dark:text-rose-300">
+              <Sparkles className="h-5 w-5" />
+            </div>
+            <div>
+              <h2 className="text-base font-semibold text-stone-900 dark:text-zinc-100">
+                AI Menstrual Health Summary
+              </h2>
+              <p className="text-xs text-stone-500 dark:text-zinc-400">
+                {displayedSummary.source === 'gemini'
+                  ? 'Personalized AI synthesis from your logged cycles, symptoms, and moods'
+                  : 'Pattern overview from your logged cycles · Click Analyze with AI for deeper synthesis'}
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            disabled={aiLoading}
+            onClick={handleGenerateAISummary}
+            className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl bg-[#BE3455] px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-[#a62a48] disabled:opacity-60 whitespace-nowrap shrink-0 dark:bg-rose-600 dark:hover:bg-rose-500"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${aiLoading ? 'animate-spin' : ''}`} />
+            <span>
+              {aiLoading
+                ? 'Analyzing Cycle Data...'
+                : aiSummary?.source === 'gemini'
+                  ? 'Refresh AI Summary'
+                  : 'Generate AI Health Insight'}
+            </span>
+          </button>
+        </div>
+
+        {aiError && (
+          <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
+            {aiError}
+          </div>
+        )}
+
+        <div className="space-y-4">
+          <p className="text-sm leading-relaxed text-stone-800 dark:text-zinc-200">
+            {displayedSummary.overallSummary}
+          </p>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 border-t border-stone-100 pt-4 dark:border-zinc-800">
+            <div className="space-y-1">
+              <h3 className="text-xs font-semibold text-stone-900 dark:text-zinc-100">
+                Cycle Regularity
+              </h3>
+              <p className="text-xs leading-relaxed text-stone-600 dark:text-zinc-400">
+                {displayedSummary.cycleRegularityAssessment}
+              </p>
+            </div>
+
+            <div className="space-y-1">
+              <h3 className="text-xs font-semibold text-stone-900 dark:text-zinc-100">
+                Symptom &amp; Mood Context
+              </h3>
+              <p className="text-xs leading-relaxed text-stone-600 dark:text-zinc-400">
+                {displayedSummary.symptomAndMoodPatterns}
+              </p>
+            </div>
+
+            <div className="space-y-1">
+              <h3 className="text-xs font-semibold text-stone-900 dark:text-zinc-100">
+                Fertility Outlook
+              </h3>
+              <p className="text-xs leading-relaxed text-stone-600 dark:text-zinc-400">
+                {displayedSummary.fertilityOutlook}
+              </p>
+            </div>
+          </div>
+
+          {/* Actionable Tips */}
+          <div className="rounded-xl bg-stone-50 p-4 dark:bg-zinc-900/70">
+            <p className="text-xs font-semibold text-stone-900 dark:text-zinc-100 mb-2">
+              Tailored Wellness &amp; Tracking Focus
+            </p>
+            <ul className="space-y-1.5 text-xs text-stone-600 dark:text-zinc-300 list-disc list-inside">
+              {displayedSummary.actionableTips.map((tip, i) => (
+                <li key={i}>{tip}</li>
+              ))}
+            </ul>
+            <p className="mt-3 border-t border-stone-200/70 pt-2.5 text-[11px] text-stone-500 dark:border-zinc-800 dark:text-zinc-400">
+              {displayedSummary.careNote}
+            </p>
+          </div>
+        </div>
+      </section>
+
+      {/* 1. Hormonal Trends Chart + Day-by-Day Symptom & Mood Expectations */}
       <section className="rounded-2xl border border-stone-200 bg-white p-5 sm:p-6 dark:border-zinc-800 dark:bg-[#17151C]">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
           <div className="flex items-center gap-2.5">
@@ -187,12 +407,11 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
                 Hormonal Rhythm Across Your Cycle
               </h2>
               <p className="text-xs text-stone-500 dark:text-zinc-400 tabular-nums">
-                Scrub or tap days 1–{forecast.averageCycleLength} to inspect Estrogen, Progesterone, LH, and FSH trends
+                Scrub or tap days 1–{forecast.averageCycleLength} to inspect hormone levels and typical symptoms/moods
               </p>
             </div>
           </div>
 
-          {/* Interactive Hormone Series Toggles */}
           <div className="flex flex-wrap items-center gap-1.5">
             {(
               [
@@ -238,7 +457,6 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
             role="img"
             aria-label="Hormonal trend curves across menstrual cycle days"
           >
-            {/* Phase background bands */}
             <rect
               x={padL}
               y={padT}
@@ -256,7 +474,6 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
               opacity={0.09}
             />
 
-            {/* Y-Axis gridlines */}
             {[25, 50, 75, 100].map((val) => {
               const y = toY(val);
               return (
@@ -282,7 +499,6 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
               );
             })}
 
-            {/* Curves */}
             {visibleHormones.fsh && (
               <path
                 d={fshPath}
@@ -293,12 +509,7 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
               />
             )}
             {visibleHormones.lh && (
-              <path
-                d={lhPath}
-                fill="none"
-                stroke="#0D9488"
-                strokeWidth={2.5}
-              />
+              <path d={lhPath} fill="none" stroke="#0D9488" strokeWidth={2.5} />
             )}
             {visibleHormones.progesterone && (
               <path
@@ -317,7 +528,6 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
               />
             )}
 
-            {/* Inspected Day Vertical Line */}
             <line
               x1={toX(activePoint.day)}
               y1={padT}
@@ -328,7 +538,6 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
               className="text-stone-800 dark:text-zinc-200"
             />
 
-            {/* Inspected Dots */}
             {visibleHormones.estrogen && (
               <circle
                 cx={toX(activePoint.day)}
@@ -360,7 +569,6 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
               />
             )}
 
-            {/* X-Axis Day Ticks */}
             {hormonePoints
               .filter(
                 (p) =>
@@ -380,7 +588,6 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
                 </text>
               ))}
 
-            {/* Invisible interactive column hit areas */}
             {hormonePoints.map((p) => {
               const colW = plotW / hormonePoints.length;
               return (
@@ -400,8 +607,8 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
           </svg>
         </div>
 
-        {/* Touch-friendly Slider Scrubber + Live Readout */}
-        <div className="mt-3 space-y-3 border-t border-stone-100 pt-4 dark:border-zinc-800">
+        {/* Scrubber + Hormone Readout + Typical Symptoms & Moods for Selected Day */}
+        <div className="mt-3 space-y-4 border-t border-stone-100 pt-4 dark:border-zinc-800">
           <div className="flex items-center gap-3">
             <label
               htmlFor="hormone-day-slider"
@@ -452,12 +659,148 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
               </p>
             </div>
           </div>
+
+          {/* Day-Specific Symptom & Mood Expectations */}
+          <div className="rounded-xl border border-stone-200/80 bg-stone-50/70 p-4 dark:border-zinc-800 dark:bg-zinc-900/60">
+            <p className="text-xs font-semibold text-stone-900 dark:text-zinc-100">
+              {dayExpectations.stageTitle} — What Is Common Today
+            </p>
+            <div className="mt-2 grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+              <div>
+                <span className="font-medium text-stone-500 dark:text-zinc-400">
+                  Common Symptoms
+                </span>
+                <p className="mt-0.5 text-stone-800 dark:text-zinc-200">
+                  {dayExpectations.typicalSymptoms.join(' · ')}
+                </p>
+              </div>
+              <div>
+                <span className="font-medium text-stone-500 dark:text-zinc-400">
+                  Typical Mood &amp; Energy
+                </span>
+                <p className="mt-0.5 text-stone-800 dark:text-zinc-200">
+                  {dayExpectations.typicalMood}
+                </p>
+              </div>
+              <div>
+                <span className="font-medium text-stone-500 dark:text-zinc-400">
+                  Hormonal Driver
+                </span>
+                <p className="mt-0.5 text-stone-800 dark:text-zinc-200">
+                  {dayExpectations.hormoneContext}
+                </p>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 
-      {/* 2. Cycle Duration History & Symptom Frequency */}
+      {/* 2. Understanding Your 4 Key Cycle Hormones */}
+      <section className="rounded-2xl border border-stone-200 bg-white p-5 sm:p-6 dark:border-zinc-800 dark:bg-[#17151C]">
+        <div className="flex items-center gap-2.5 mb-4">
+          <BookOpen className="h-5 w-5 text-[#BE3455] dark:text-rose-400" />
+          <div>
+            <h2 className="text-sm font-semibold text-stone-900 dark:text-zinc-100">
+              Understanding Your Cycle Hormones
+            </h2>
+            <p className="text-xs text-stone-500 dark:text-zinc-400">
+              What Estrogen, Progesterone, LH, and FSH do and how they shape your monthly symptoms
+            </p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {HORMONE_DEFINITIONS.map((h) => (
+            <div
+              key={h.id}
+              className="rounded-xl border border-stone-200/80 bg-stone-50/60 p-4 dark:border-zinc-800 dark:bg-zinc-900/50"
+            >
+              <div className="flex items-center gap-2">
+                <span
+                  className="h-2.5 w-2.5 rounded-full shrink-0"
+                  style={{ backgroundColor: h.color }}
+                  aria-hidden="true"
+                />
+                <h3 className="text-sm font-semibold text-stone-900 dark:text-zinc-100">
+                  {h.name}
+                </h3>
+              </div>
+              <p className="mt-2 text-xs leading-relaxed text-stone-700 dark:text-zinc-300">
+                {h.roleSummary}
+              </p>
+              <div className="mt-3 space-y-1 border-t border-stone-200/70 pt-2.5 text-xs text-stone-600 dark:border-zinc-800 dark:text-zinc-400">
+                <p>
+                  <strong className="font-semibold text-stone-800 dark:text-zinc-200">
+                    When it peaks:
+                  </strong>{' '}
+                  {h.peakTiming}
+                </p>
+                <p>
+                  <strong className="font-semibold text-stone-800 dark:text-zinc-200">
+                    How it feels:
+                  </strong>{' '}
+                  {h.bodyEffects}
+                </p>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* 3. Common Symptoms & Mood Shifts Across Each Cycle Stage */}
+      <section className="rounded-2xl border border-stone-200 bg-white p-5 sm:p-6 dark:border-zinc-800 dark:bg-[#17151C]">
+        <div className="flex items-center gap-2.5 mb-4">
+          <HeartPulse className="h-5 w-5 text-[#BE3455] dark:text-rose-400" />
+          <div>
+            <h2 className="text-sm font-semibold text-stone-900 dark:text-zinc-100">
+              Common Symptoms &amp; Mood Shifts by Cycle Day
+            </h2>
+            <p className="text-xs text-stone-500 dark:text-zinc-400 tabular-nums">
+              Adapted to your {forecast.averageCycleLength}-day cycle and {forecast.averagePeriodLength}-day period length
+            </p>
+          </div>
+        </div>
+
+        <div className="divide-y divide-stone-100 dark:divide-zinc-800">
+          {stageGuides.map((stage) => (
+            <div
+              key={stage.id}
+              className="py-3.5 first:pt-0 last:pb-0 grid grid-cols-1 md:grid-cols-12 gap-3"
+            >
+              <div className="md:col-span-4">
+                <p className="text-xs font-mono-nums font-semibold text-[#BE3455] dark:text-rose-400">
+                  {stage.dayRangeLabel}
+                </p>
+                <h3 className="mt-0.5 text-sm font-semibold text-stone-900 dark:text-zinc-100">
+                  {stage.title}
+                </h3>
+                <p className="mt-1 text-xs text-stone-500 dark:text-zinc-400">
+                  {stage.whyItHappens}
+                </p>
+              </div>
+              <div className="md:col-span-4">
+                <span className="text-[11px] font-semibold text-stone-500 dark:text-zinc-400">
+                  Common Physical Signs
+                </span>
+                <p className="mt-1 text-xs leading-relaxed text-stone-800 dark:text-zinc-200">
+                  {stage.commonSymptoms.join(' · ')}
+                </p>
+              </div>
+              <div className="md:col-span-4">
+                <span className="text-[11px] font-semibold text-stone-500 dark:text-zinc-400">
+                  Mood &amp; Energy Pattern
+                </span>
+                <p className="mt-1 text-xs leading-relaxed text-stone-800 dark:text-zinc-200">
+                  {stage.moodAndEnergy}
+                </p>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* 4. Cycle Duration History & Personal Symptom Frequency */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Cycle & Period Length History */}
         <section className="lg:col-span-6 rounded-2xl border border-stone-200 bg-white p-5 sm:p-6 dark:border-zinc-800 dark:bg-[#17151C]">
           <div className="flex items-center gap-2 mb-4">
             <BarChart3 className="h-5 w-5 text-[#BE3455] dark:text-rose-400" />
@@ -466,7 +809,8 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
                 Cycle &amp; Period Duration History
               </h2>
               <p className="text-xs text-stone-500 dark:text-zinc-400 tabular-nums">
-                Average cycle: {forecast.averageCycleLength} days · Average flow: {forecast.averagePeriodLength} days
+                Average cycle: {forecast.averageCycleLength} days · Average flow:{' '}
+                {forecast.averagePeriodLength} days
               </p>
             </div>
           </div>
@@ -493,12 +837,10 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
                       </span>
                     </div>
                     <div className="relative h-5 w-full overflow-hidden rounded-lg bg-stone-100 dark:bg-zinc-900">
-                      {/* Total cycle bar */}
                       <div
                         className="h-full rounded-lg bg-stone-300 dark:bg-zinc-700 transition-all"
                         style={{ width: `${cyclePct}%` }}
                       />
-                      {/* Bleeding portion overlay */}
                       <div
                         className="absolute inset-y-0 left-0 rounded-l-lg bg-[#BE3455] dark:bg-rose-600 transition-all"
                         style={{ width: `${periodPct}%` }}
@@ -522,11 +864,10 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
           )}
         </section>
 
-        {/* Monthly Symptom & Phase Patterns */}
         <section className="lg:col-span-6 rounded-2xl border border-stone-200 bg-white p-5 sm:p-6 dark:border-zinc-800 dark:bg-[#17151C]">
           <div className="mb-4">
             <h2 className="text-sm font-semibold text-stone-900 dark:text-zinc-100">
-              Monthly Symptom &amp; Health Patterns
+              Your Logged Symptom &amp; Phase Patterns
             </h2>
             <p className="text-xs text-stone-500 dark:text-zinc-400 tabular-nums">
               Across {totalLoggedDays} logged day{totalLoggedDays === 1 ? '' : 's'}
@@ -564,7 +905,6 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
                 })}
               </div>
 
-              {/* Phase Correlations */}
               <div className="border-t border-stone-100 pt-3.5 dark:border-zinc-800">
                 <p className="mb-2 text-xs font-semibold text-stone-700 dark:text-zinc-300">
                   Top Symptoms by Cycle Phase
@@ -598,7 +938,7 @@ export const InsightsView: React.FC<InsightsViewProps> = ({
         </section>
       </div>
 
-      {/* Optional Basal Body Temperature (BBT) Tracker Card if BBT logs exist */}
+      {/* Basal Body Temperature (BBT) Tracker Card if BBT logs exist */}
       {bbtPoints.length > 0 && (
         <section className="rounded-2xl border border-stone-200 bg-white p-5 sm:p-6 dark:border-zinc-800 dark:bg-[#17151C]">
           <div className="flex items-center gap-2 mb-3">

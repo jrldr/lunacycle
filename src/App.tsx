@@ -584,7 +584,12 @@ export default function App() {
         )}
 
         {activeTab === 'insights' && (
-          <InsightsView cycles={cycles} logs={logs} forecast={forecast} />
+          <InsightsView
+            profile={profile}
+            cycles={cycles}
+            logs={logs}
+            forecast={forecast}
+          />
         )}
 
         {activeTab === 'profile' && (
