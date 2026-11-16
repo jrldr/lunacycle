@@ -198,7 +198,7 @@ export default function App() {
         body: `You are in your peak fertility phase (ovulation est. ${formatShortDate(
           forecast.ovulationDate
         )}).`,
-        icon: '/pwa-192x192.png',
+        icon: `${import.meta.env.BASE_URL}pwa-192x192.png`,
       });
       safeSetStorageItem(lastNotifiedKey, today);
     } else if (forecast.isInFertileWindow) {
@@ -206,7 +206,7 @@ export default function App() {
         body: `Your fertile window runs ${formatShortDate(
           forecast.fertileWindowStart
         )} – ${formatShortDate(forecast.fertileWindowEnd)}.`,
-        icon: '/pwa-192x192.png',
+        icon: `${import.meta.env.BASE_URL}pwa-192x192.png`,
       });
       safeSetStorageItem(lastNotifiedKey, today);
     } else if (forecast.isPeriodSoon) {
@@ -214,7 +214,7 @@ export default function App() {
         body: `Your next period is expected in ${forecast.daysUntilNextPeriod} day(s) around ${formatShortDate(
           forecast.nextPeriodStart
         )}.`,
-        icon: '/pwa-192x192.png',
+        icon: `${import.meta.env.BASE_URL}pwa-192x192.png`,
       });
       safeSetStorageItem(lastNotifiedKey, today);
     }
